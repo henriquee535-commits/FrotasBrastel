@@ -159,7 +159,7 @@ elif menu == "📋 Portaria":
             with st.form("fs"):
                 c1, c2 = st.columns(2)
                 v_s = c1.selectbox("Carro:", [f"{v['id']} | {v['placa']} (KM: {v['km_atual']})" for v in v_disp])
-                c_s = c2.selectbox("Motorista:", [f"{c['id']} | {c['nome']} (CNH: {c['cnh']})" for c_atv])
+                c_s = c2.selectbox("Motorista:", [f"{c['id']} | {c['nome']} (CNH: {c['cnh']})" for c in c_atv])
                 km_s = st.number_input("KM Inicial:", min_value=0, step=1)
                 cc_v = st.selectbox("CC da Viagem:", lista_cc)
                 if st.form_submit_button("Liberar"):
