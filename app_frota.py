@@ -3,14 +3,9 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
-from datetime import datetime
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. CONFIGURAÇÃO E CONEXÃO
-# ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Gestão de Frota", layout="wide", page_icon="🚙")
+st.set_page_config(page_title="Gestão de Frota V2", layout="wide", page_icon="🚙")
 
-# Para rodar localmente, garanta que a DATABASE_URL esteja no .streamlit/secrets.toml
 DATABASE_URL = st.secrets["DATABASE_URL"]
 
 @contextmanager
@@ -26,172 +21,214 @@ def get_conn():
         conn.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. ARQUITETURA DO BANCO DE DADOS (OS PILARES)
+# 1. INIT DB: NOVAS TABELAS (CCs, Multas, Avarias, Transferências)
 # ══════════════════════════════════════════════════════════════════════════════
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as c:
-            # Tabela de Veículos (O 'Estoque')
+            c.execute('CREATE TABLE IF NOT EXISTS centros_custo (nome TEXT PRIMARY KEY)')
+            
             c.execute('''
                 CREATE TABLE IF NOT EXISTS veiculos (
-                    id SERIAL PRIMARY KEY,
-                    placa TEXT UNIQUE NOT NULL,
-                    modelo TEXT NOT NULL,
-                    cc_fixo TEXT NOT NULL,
-                    tipo_contrato TEXT CHECK (tipo_contrato IN ('Próprio', 'Locação Mensal', 'Locação Diária')),
-                    status TEXT DEFAULT 'Disponível' CHECK (status IN ('Disponível', 'Em Uso', 'Manutenção', 'Inativo'))
+                    id SERIAL PRIMARY KEY, placa TEXT UNIQUE NOT NULL, modelo TEXT NOT NULL,
+                    cc_atual TEXT REFERENCES centros_custo(nome),
+                    tipo_contrato TEXT, custo_fixo_mensal NUMERIC(10,2) DEFAULT 0,
+                    status TEXT DEFAULT 'Disponível'
                 )
             ''')
             
-            # Tabela de Condutores (Os 'Colaboradores')
             c.execute('''
                 CREATE TABLE IF NOT EXISTS condutores (
-                    id SERIAL PRIMARY KEY,
-                    nome TEXT NOT NULL,
-                    cnh TEXT UNIQUE NOT NULL,
-                    validade_cnh DATE NOT NULL,
-                    cc_padrao TEXT NOT NULL,
-                    status TEXT DEFAULT 'Ativo' CHECK (status IN ('Ativo', 'Bloqueado'))
+                    id SERIAL PRIMARY KEY, nome TEXT NOT NULL, cnh TEXT UNIQUE NOT NULL,
+                    validade_cnh DATE NOT NULL, cc_padrao TEXT REFERENCES centros_custo(nome)
                 )
             ''')
             
-            # Tabela Diário de Bordo (A 'Movimentação / RDM-CGM')
             c.execute('''
                 CREATE TABLE IF NOT EXISTS diario_bordo (
-                    id SERIAL PRIMARY KEY,
-                    veiculo_id INTEGER REFERENCES veiculos(id),
-                    condutor_id INTEGER REFERENCES condutores(id),
-                    cc_viagem TEXT NOT NULL,
-                    data_saida TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    km_saida INTEGER NOT NULL,
-                    data_retorno TIMESTAMP,
-                    km_retorno INTEGER,
-                    status TEXT DEFAULT 'Em Andamento' CHECK (status IN ('Em Andamento', 'Concluído'))
+                    id SERIAL PRIMARY KEY, veiculo_id INTEGER REFERENCES veiculos(id),
+                    condutor_id INTEGER REFERENCES condutores(id), cc_viagem TEXT REFERENCES centros_custo(nome),
+                    km_saida INTEGER NOT NULL, km_retorno INTEGER, data_retorno DATE, status TEXT DEFAULT 'Em Andamento'
                 )
             ''')
-            
-            # Tabela de Custos Financeiros (O Motor do Rateio / DRE)
+
             c.execute('''
-                CREATE TABLE IF NOT EXISTS despesas_frota (
-                    id SERIAL PRIMARY KEY,
-                    diario_id INTEGER REFERENCES diario_bordo(id), -- Pode ser nulo se for custo fixo mensal
-                    veiculo_id INTEGER REFERENCES veiculos(id),
-                    tipo_despesa TEXT CHECK (tipo_despesa IN ('Combustível', 'Manutenção', 'Multa', 'Locação', 'Seguro/IPVA')),
-                    valor NUMERIC(10, 2) NOT NULL,
-                    cc_pagador TEXT NOT NULL,
-                    data_competencia DATE NOT NULL
+                CREATE TABLE IF NOT EXISTS multas (
+                    id SERIAL PRIMARY KEY, veiculo_id INTEGER REFERENCES veiculos(id),
+                    condutor_id INTEGER REFERENCES condutores(id), data_infracao DATE NOT NULL,
+                    valor NUMERIC(10,2) NOT NULL, descricao TEXT, status TEXT DEFAULT 'A Pagar'
+                )
+            ''')
+
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS avarias (
+                    id SERIAL PRIMARY KEY, veiculo_id INTEGER REFERENCES veiculos(id),
+                    condutor_relacionado INTEGER REFERENCES condutores(id), data_registro DATE NOT NULL,
+                    descricao TEXT NOT NULL, custo_estimado NUMERIC(10,2)
+                )
+            ''')
+
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS transferencias_cc (
+                    id SERIAL PRIMARY KEY, veiculo_id INTEGER REFERENCES veiculos(id),
+                    cc_origem TEXT, cc_destino TEXT REFERENCES centros_custo(nome),
+                    data_transferencia DATE DEFAULT CURRENT_DATE, km_transferencia INTEGER NOT NULL
                 )
             ''')
 init_db()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. HELPERS DE CONSULTA
-# ══════════════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=60)
-def carregar_veiculos(apenas_disponiveis=False):
+# Funções de Cache
+@st.cache_data(ttl=10)
+def carregar_dados(tabela):
     with get_conn() as conn:
         with conn.cursor() as c:
-            query = "SELECT * FROM veiculos"
-            if apenas_disponiveis:
-                query += " WHERE status = 'Disponível'"
-            c.execute(query)
+            c.execute(f"SELECT * FROM {tabela}")
             return pd.DataFrame(c.fetchall())
 
-@st.cache_data(ttl=60)
-def carregar_condutores(apenas_ativos=True):
-    with get_conn() as conn:
-        with conn.cursor() as c:
-            query = "SELECT * FROM condutores WHERE validade_cnh >= CURRENT_DATE" if apenas_ativos else "SELECT * FROM condutores"
-            c.execute(query)
-            return pd.DataFrame(c.fetchall())
+@st.cache_data(ttl=10)
+def lista_ccs():
+    df = carregar_dados("centros_custo")
+    return df['nome'].tolist() if not df.empty else []
+
+df_veiculos = carregar_dados("veiculos")
+df_condutores = carregar_dados("condutores")
+ccs = lista_ccs()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. INTERFACE E ROTEAMENTO DE MÓDULOS
+# 2. ROTEAMENTO
 # ══════════════════════════════════════════════════════════════════════════════
-st.sidebar.title("🚙 Menu Frota")
-modulo = st.sidebar.radio("Navegação:", [
-    "📋 Diário de Bordo (Pátio)", 
-    "💰 Lançamento de Despesas", 
-    "📊 Rateio Mensal (DRE)", 
-    "⚙️ Cadastros Base"
+st.sidebar.title("🚙 Frota Brastel")
+modulo = st.sidebar.radio("Ir para:", [
+    "📋 Diário de Bordo", "🚨 Multas e Avarias", "🔄 Transferência de CC", 
+    "📊 Rateio Mensal (DRE)", "⚙️ Administração"
 ])
-st.sidebar.divider()
-
-# Lista de Centros de Custo (Mock - idealmente vindo do DB)
-LISTA_CC = ["Comercial", "Engenharia", "Diretoria", "Operações", "TI"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-if modulo == "📋 Diário de Bordo (Pátio)":
-    st.title("Controle de Pátio: Saídas e Retornos")
-    aba1, aba2 = st.tabs(["🚀 Registrar Saída (Check-out)", "📥 Registrar Retorno (Check-in)"])
-    
-    with aba1:
-        st.subheader("Liberar Veículo")
-        df_v = carregar_veiculos(apenas_disponiveis=True)
-        df_c = carregar_condutores(apenas_ativos=True)
-        
-        if df_v.empty or df_c.empty:
-            st.warning("Cadastre veículos disponíveis e condutores válidos primeiro.")
+if modulo == "⚙️ Administração":
+    st.title("⚙️ Configurações e Cadastros")
+    tab1, tab2, tab3 = st.tabs(["🏢 Centros de Custo", "👷 Condutores / 🚙 Veículos", "⚠️ Zona de Perigo"])
+
+    with tab1:
+        cc_novo = st.text_input("Novo Centro de Custo:")
+        if st.button("Cadastrar CC") and cc_novo:
+            with get_conn() as conn:
+                with conn.cursor() as c: c.execute("INSERT INTO centros_custo (nome) VALUES (%s) ON CONFLICT DO NOTHING", (cc_novo,))
+            st.success(f"{cc_novo} cadastrado!"); st.rerun()
+        if ccs: st.write("CCs Cadastrados:", ccs)
+
+    with tab2:
+        if not ccs: st.warning("Cadastre um CC primeiro.")
         else:
-            with st.form("form_saida"):
-                c1, c2 = st.columns(2)
-                veiculo_sel = c1.selectbox("Veículo:", df_v['placa'] + " - " + df_v['modelo'])
-                condutor_sel = c2.selectbox("Condutor:", df_c['nome'] + " (CNH válida)")
-                
-                c3, c4 = st.columns(2)
-                km_saida = c3.number_input("Hodômetro Atual (KM):", min_value=0, step=1)
-                cc_viagem = c4.selectbox("Centro de Custo Responsável pela Viagem:", LISTA_CC)
-                
-                if st.form_submit_button("Liberar Veículo", type="primary"):
-                    # Aqui entraremos com a lógica SQL de INSERT no diario_bordo e UPDATE no status do veiculo
-                    st.info("Lógica de banco a ser implementada na nossa lapidação!")
+            with st.form("f_cond"):
+                st.subheader("Novo Condutor")
+                c1, c2, c3, c4 = st.columns(4)
+                nome = c1.text_input("Nome:"); cnh = c2.text_input("CNH:"); val = c3.date_input("Validade:"); cc_c = c4.selectbox("CC Padrão:", ccs)
+                if st.form_submit_button("Salvar Condutor"):
+                    with get_conn() as conn:
+                        with conn.cursor() as c: c.execute("INSERT INTO condutores (nome, cnh, validade_cnh, cc_padrao) VALUES (%s,%s,%s,%s)", (nome, cnh, val, cc_c))
+                    st.success("Salvo!"); st.rerun()
 
-    with aba2:
-        st.subheader("Receber Veículo")
-        # Aqui buscaremos os veículos com status 'Em Uso'
-        st.write("Selecione o veículo retornando, informe o KM final, combustível e check-list de avarias.")
-        # Todo: Lógica de Check-in
+            with st.form("f_veic"):
+                st.subheader("Novo Veículo")
+                v1, v2, v3, v4 = st.columns(4)
+                placa = v1.text_input("Placa:"); mod = v2.text_input("Modelo:"); cc_v = v3.selectbox("CC Fixo:", ccs); custo = v4.number_input("Mensalidade (R$):", min_value=0.0)
+                if st.form_submit_button("Salvar Veículo"):
+                    with get_conn() as conn:
+                        with conn.cursor() as c: c.execute("INSERT INTO veiculos (placa, modelo, cc_atual, custo_fixo_mensal) VALUES (%s,%s,%s,%s)", (placa.upper(), mod, cc_v, custo))
+                    st.success("Salvo!"); st.rerun()
+
+    with tab3:
+        st.error("Área de Limpeza do Banco de Dados (FASE DE TESTES)")
+        confirmar = st.checkbox("Tenho certeza que quero apagar TODOS os dados do sistema.")
+        if confirmar and st.button("🚨 ZERAR TUDO", type="primary"):
+            with get_conn() as conn:
+                with conn.cursor() as c:
+                    # A ordem importa por conta das Foreign Keys
+                    tabelas = ["transferencias_cc", "avarias", "multas", "diario_bordo", "veiculos", "condutores", "centros_custo"]
+                    for t in tabelas: c.execute(f"TRUNCATE TABLE {t} CASCADE")
+            st.success("Banco de dados zerado com sucesso!"); st.rerun()
 
 # ──────────────────────────────────────────────────────────────────────────────
-elif modulo == "💰 Lançamento de Despesas":
-    st.title("Registro de Custos Diretos")
-    st.write("Lançamento de Combustível, Multas e Manutenções Corretivas.")
+elif modulo == "🚨 Multas e Avarias":
+    st.title("Ocorrências")
+    aba_m, aba_a = st.tabs(["💸 Multas", "💥 Avarias"])
     
-    with st.form("form_despesa"):
-        tipo = st.selectbox("Tipo de Despesa:", ["Combustível", "Manutenção", "Multa", "Locação Extra"])
-        c1, c2, c3 = st.columns(3)
-        valor = c1.number_input("Valor (R$):", min_value=0.01, format="%.2f")
-        data_comp = c2.date_input("Data da Competência:")
-        cc_pagador = c3.selectbox("Alocar para o CC:", LISTA_CC)
-        
-        st.text_area("Observações / Justificativa:")
-        
-        if st.form_submit_button("Registrar Custo"):
-            st.info("Lógica de banco a ser implementada na nossa lapidação!")
+    if df_veiculos.empty or df_condutores.empty: st.warning("Cadastre veículos e condutores.")
+    else:
+        with aba_m:
+            with st.form("f_multa"):
+                c1, c2 = st.columns(2)
+                veic_m = c1.selectbox("Veículo (Placa):", df_veiculos['id'].astype(str) + " - " + df_veiculos['placa'])
+                cond_m = c2.selectbox("Condutor Infrator:", df_condutores['id'].astype(str) + " - " + df_condutores['nome'])
+                v1, v2 = st.columns(2); data_m = v1.date_input("Data da Infração:"); valor_m = v2.number_input("Valor (R$):")
+                desc_m = st.text_input("Descrição / Local:")
+                if st.form_submit_button("Registrar Multa"):
+                    vid, cid = veic_m.split(" - ")[0], cond_m.split(" - ")[0]
+                    with get_conn() as conn:
+                        with conn.cursor() as c: c.execute("INSERT INTO multas (veiculo_id, condutor_id, data_infracao, valor, descricao) VALUES (%s,%s,%s,%s,%s)", (vid, cid, data_m, valor_m, desc_m))
+                    st.success("Multa registrada!")
+
+        with aba_a:
+            with st.form("f_avaria"):
+                c1, c2 = st.columns(2)
+                veic_a = c1.selectbox("Veículo Avariado:", df_veiculos['id'].astype(str) + " - " + df_veiculos['placa'])
+                cond_a = c2.selectbox("Condutor Relacionado (Opcional):", ["Nenhum"] + (df_condutores['id'].astype(str) + " - " + df_condutores['nome']).tolist())
+                v1, v2 = st.columns(2); data_a = v1.date_input("Data do Registro:"); valor_a = v2.number_input("Custo Estimado (R$):")
+                desc_a = st.text_area("Detalhes da Avaria:")
+                if st.form_submit_button("Registrar Avaria"):
+                    vid = veic_a.split(" - ")[0]
+                    cid = None if cond_a == "Nenhum" else cond_a.split(" - ")[0]
+                    with get_conn() as conn:
+                        with conn.cursor() as c: c.execute("INSERT INTO avarias (veiculo_id, condutor_relacionado, data_registro, descricao, custo_estimado) VALUES (%s,%s,%s,%s,%s)", (vid, cid, data_a, desc_a, valor_a))
+                    st.success("Avaria registrada!")
+
+# ──────────────────────────────────────────────────────────────────────────────
+elif modulo == "🔄 Transferência de CC":
+    st.title("Transferência de Frota entre Centros de Custo")
+    if df_veiculos.empty: st.warning("Sem veículos.")
+    else:
+        with st.form("f_transf"):
+            v_sel = st.selectbox("Selecione o Veículo:", df_veiculos['placa'] + " (Atual: " + df_veiculos['cc_atual'] + ")")
+            cc_novo = st.selectbox("Transferir para o CC:", ccs)
+            km_transf = st.number_input("KM Exato no momento da transferência:", min_value=0)
+            
+            if st.form_submit_button("Efetivar Transferência", type="primary"):
+                placa = v_sel.split(" ")[0]
+                veiculo = df_veiculos[df_veiculos['placa'] == placa].iloc[0]
+                if veiculo['cc_atual'] == cc_novo: st.error("O veículo já pertence a este CC.")
+                else:
+                    with get_conn() as conn:
+                        with conn.cursor() as c:
+                            c.execute("INSERT INTO transferencias_cc (veiculo_id, cc_origem, cc_destino, km_transferencia) VALUES (%s,%s,%s,%s)", (veiculo['id'], veiculo['cc_atual'], cc_novo, km_transf))
+                            c.execute("UPDATE veiculos SET cc_atual = %s WHERE id = %s", (cc_novo, veiculo['id']))
+                    st.success(f"Veículo {placa} transferido para {cc_novo}!"); st.rerun()
 
 # ──────────────────────────────────────────────────────────────────────────────
 elif modulo == "📊 Rateio Mensal (DRE)":
-    st.title("Fechamento Contábil e Rateio")
-    st.markdown("""
-    Nesta tela, vamos construir o motor do rateio:
-    1. O script vai somar todos os custos Fixos (Locação, IPVA).
-    2. Vai calcular a proporção de KM rodado por cada Centro de Custo no mês selecionado.
-    3. Vai distribuir o custo fixo usando a proporção do KM e somar aos custos diretos (combustível da viagem específica).
-    """)
-    mes_fechamento = st.selectbox("Mês de Competência:", ["04/2026", "05/2026", "06/2026"])
+    st.title("Simulador de Rateio (Protótipo)")
+    st.write("A lógica estrutural: Custo Fixo do Veículo proporcional ao KM rodado por CC.")
     
-    if st.button("🔄 Simular Rateio", type="primary"):
-        st.info("Aqui vamos gerar o DataFrame com a DRE formatada pronta para exportação.")
+    # Gerando dados fictícios para demonstrar o cálculo se o banco estiver vazio
+    st.info("Demonstração da lógica (Mockup Data)")
+    dados_viagens = pd.DataFrame({
+        'Veículo': ['ABC-1234', 'ABC-1234', 'ABC-1234'],
+        'CC_Viagem': ['Comercial', 'Comercial', 'Engenharia'],
+        'KM_Rodado': [200, 300, 500] # Total rodado: 1000 KM
+    })
+    custo_fixo_veiculo = 2000.00 # Ex: Locação mensal
+
+    # Cálculo do Rateio
+    resumo_km = dados_viagens.groupby(['Veículo', 'CC_Viagem'])['KM_Rodado'].sum().reset_index()
+    total_km_veiculo = resumo_km.groupby('Veículo')['KM_Rodado'].sum().reset_index().rename(columns={'KM_Rodado': 'KM_Total'})
+    
+    rateio = pd.merge(resumo_km, total_km_veiculo, on='Veículo')
+    rateio['% de Uso'] = (rateio['KM_Rodado'] / rateio['KM_Total'])
+    rateio['Custo Alocado (R$)'] = rateio['% de Uso'] * custo_fixo_veiculo
+    rateio['% de Uso'] = (rateio['% de Uso'] * 100).round(2).astype(str) + "%"
+
+    st.dataframe(rateio, use_container_width=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
-elif modulo == "⚙️ Cadastros Base":
-    st.title("Cadastros Fundamentais")
-    aba_v, aba_c = st.tabs(["Carros", "Motoristas"])
-    
-    with aba_v:
-        # Tabela e form simplificado de veículos
-        st.dataframe(carregar_veiculos(), use_container_width=True)
-        
-    with aba_c:
-        # Tabela e form simplificado de condutores
-        st.dataframe(carregar_condutores(apenas_ativos=False), use_container_width=True)
+elif modulo == "📋 Diário de Bordo":
+    st.title("Pátio")
+    st.write("Módulo em construção para a próxima iteração.")
